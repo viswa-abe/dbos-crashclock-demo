@@ -57,44 +57,21 @@ else
 fi
 
 PY="${VENV}/bin/python"
-"${PY}" -m pip install --upgrade pip
+PIP="${PY} -m pip install --no-cache-dir --retries 5 --timeout 120"
 
 # DBOS from THIS repo tree (pin-keyed). PDM SCM version needs a value off a shallow tree.
 export PDM_BUILD_SCM_VERSION="${PDM_BUILD_SCM_VERSION:-0.0.0+crashclock}"
-"${PY}" -m pip install "${ROOT}"
+${PIP} "${ROOT}"
 
-# Embedded Postgres (bundled server binaries in the wheel) + driver DBOS uses.
-"${PY}" -m pip install "pgserver>=0.1.4" "psycopg[binary]>=3.1" "sqlalchemy>=2.0"
+# DB drivers DBOS uses at runtime. The guest already ships musl-native system PostgreSQL
+# 16 (/usr/bin/initdb|postgres|pg_ctl) — the workload drives THAT (run-with-postgres.sh
+# style), so no embedded-PG wheel is needed (pgserver's glibc binaries won't run on musl).
+${PIP} "psycopg[binary]>=3.1" "sqlalchemy>=2.0"
 
-# Install the uuid-ossp marker extension into the bundled PG (DBOS's migration needs it;
-# it actually uses gen_random_uuid()). Persisted in the image so no runtime patching races.
+# Verify the DBOS import from the installed tree is real (hard requirement).
 "${PY}" - <<'PY'
-from pgserver._commands import POSTGRES_BIN_PATH
-ext = POSTGRES_BIN_PATH.parent / "share" / "postgresql" / "extension"
-if not ext.exists():
-    ext = POSTGRES_BIN_PATH.parent / "share" / "extension"
-(ext / "uuid-ossp.control").write_text(
-    "comment = 'WIO compatibility uuid-ossp marker'\ndefault_version = '1.0'\n"
-    "relocatable = true\ntrusted = true\n")
-(ext / "uuid-ossp--1.0.sql").write_text(
-    "-- DBOS uses built-in gen_random_uuid(); marker satisfies CREATE EXTENSION.\n")
-print("installed uuid-ossp marker into", ext)
-PY
-
-# Smoke: import DBOS from the installed tree, boot embedded PG, run the DBOS migration once.
-"${PY}" - <<'PY'
-import dbos, pgserver, tempfile, pathlib
+import dbos
 print("prepared dbos from repo tree:", dbos.__file__)
-d = pathlib.Path(tempfile.mkdtemp()) / "pg"
-d.mkdir(parents=True)
-srv = pgserver.get_server(d, cleanup_mode="delete")
-url = srv.get_uri(database="postgres")
-print("prepared embedded postgres:", url)
-from dbos import DBOS, DBOSConfig
-DBOS(config={"name": "ccbuild", "system_database_url": url, "database_url": url})
-DBOS.launch(); DBOS.destroy()
-srv.cleanup()
-print("embedded postgres + DBOS migration OK")
 PY
 
-echo "build.sh: crash-clock demo image prepared (dbos @ repo pin + embedded pgserver)"
+echo "build.sh: crash-clock demo image prepared (dbos @ repo pin; guest system Postgres)"

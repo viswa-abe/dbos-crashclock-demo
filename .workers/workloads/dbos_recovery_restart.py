@@ -107,65 +107,115 @@ APP_SRC = textwrap.dedent(
 )
 
 
+PG_BIN = os.environ.get("CC_PG_BIN", "/usr/bin")
+PG_PORT = int(os.environ.get("CC_PG_PORT", "5432"))
+PG_HOST = "127.0.0.1"
+
+
 def ensure_uuid_ossp_stub() -> None:
-    """DBOS's migration runs CREATE EXTENSION "uuid-ossp", but the pgserver-bundled
-    Postgres does not ship it (DBOS actually uses the built-in gen_random_uuid()). Install
-    a no-op marker extension so CREATE EXTENSION succeeds — same trick as the corpus's
+    """DBOS's migration runs CREATE EXTENSION "uuid-ossp", which the guest's system
+    PostgreSQL may not ship (DBOS actually uses the built-in gen_random_uuid()). Install a
+    no-op marker so CREATE EXTENSION succeeds — same trick as the corpus's
     run-with-postgres.sh. Idempotent."""
-    from pgserver._commands import POSTGRES_BIN_PATH
-    ext_dir = POSTGRES_BIN_PATH.parent / "share" / "postgresql" / "extension"
-    if not ext_dir.exists():  # layout fallback
-        ext_dir = POSTGRES_BIN_PATH.parent / "share" / "extension"
+    try:
+        share = subprocess.run([f"{PG_BIN}/pg_config", "--sharedir"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        share = "/usr/share/postgresql16"
+    ext_dir = Path(share) / "extension"
     ctrl = ext_dir / "uuid-ossp.control"
-    if ctrl.exists():
+    if ctrl.exists() or not ext_dir.exists():
         return
-    ctrl.write_text(
-        "comment = 'WIO compatibility uuid-ossp marker'\n"
-        "default_version = '1.0'\nrelocatable = true\ntrusted = true\n"
-    )
-    (ext_dir / "uuid-ossp--1.0.sql").write_text(
-        "-- DBOS uses built-in gen_random_uuid(); this marker satisfies CREATE EXTENSION.\n"
-    )
+    try:
+        ctrl.write_text(
+            "comment = 'WIO compatibility uuid-ossp marker'\n"
+            "default_version = '1.0'\nrelocatable = true\ntrusted = true\n")
+        (ext_dir / "uuid-ossp--1.0.sql").write_text(
+            "-- DBOS uses built-in gen_random_uuid(); marker satisfies CREATE EXTENSION.\n")
+    except PermissionError:
+        pass  # dir not writable; DBOS migration may still succeed if ext already present
 
 
-class PgserverHandle(cc.DependencyHandle):
-    """Embedded Postgres (pgserver) as a crash-clock dependency.
+def _run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
-    stop() = pg_ctl stop -m immediate (crash-like, drops live connections -> the transient
-    OperationalError the recovery path must survive). start() = bring it back.
+
+class SystemPgHandle(cc.DependencyHandle):
+    """The guest's SYSTEM PostgreSQL 16 (musl-native /usr/bin binaries) as a crash-clock
+    dependency — the same approach as the corpus run-with-postgres.sh. The guest runs as
+    root, so the server itself runs as the unprivileged 'postgres' user.
+
+    stop()  = pg_ctl -m immediate stop (crash-like; drops live connections -> the transient
+              OperationalError the recovery path must survive).
+    start() = pg_ctl start (bring it back).
     """
 
     def __init__(self, pgdata: Path):
-        import pgserver
         ensure_uuid_ossp_stub()
-        self._pgserver = pgserver
         self.pgdata = pgdata
-        self.server = pgserver.get_server(pgdata, cleanup_mode="delete")
+        self._as_postgres = (os.getuid() == 0)
+        if self.pgdata.exists():
+            import shutil
+            shutil.rmtree(self.pgdata, ignore_errors=True)
+        self.pgdata.mkdir(parents=True, exist_ok=True)
+        if self._as_postgres:
+            _run(["chown", "-R", "postgres:postgres", str(self.pgdata)])
+        self._initdb()
+        self.start()
+
+    def _sh(self, shell_cmd: str, timeout=60):
+        """Run a pg command, as the postgres user when we are root."""
+        if self._as_postgres:
+            return _run(["su", "postgres", "-c", shell_cmd], timeout=timeout)
+        return _run(["sh", "-c", shell_cmd], timeout=timeout)
+
+    def _initdb(self):
+        # -U postgres so the superuser role is 'postgres' regardless of the OS user that
+        # runs initdb (root->su postgres in the guest; the invoking user locally).
+        # --no-sync: skip fsync during initdb — the DB is ephemeral per case, and TCG
+        # single-thread emulation makes syncing initdb pathologically slow (90s+).
+        r = self._sh(f"{PG_BIN}/initdb -D '{self.pgdata}' -A trust -U postgres "
+                     f"--encoding=UTF8 --no-locale --no-sync", timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"initdb failed: {r.stderr[-400:]}")
 
     def uri(self) -> str:
-        return self.server.get_uri(database="postgres")
-
-    def stop(self) -> None:
-        from pgserver._commands import pg_ctl
-        try:
-            pg_ctl(["-m", "immediate", "stop"], pgdata=self.pgdata, timeout=15)
-        except Exception as exc:
-            cc.log(f"pg stop note: {type(exc).__name__}: {exc}")
+        return f"postgresql://postgres@{PG_HOST}:{PG_PORT}/postgres"
 
     def start(self) -> None:
-        # ensure_postgres_running re-reads postmaster state and restarts if down
-        self.server.ensure_postgres_running()
+        log = self.pgdata / "server.log"
+        # fsync=off / synchronous_commit=off: ephemeral per-case DB on slow TCG emulation;
+        # durability across a HOST crash is irrelevant (we only crash PG, not the guest).
+        opts = (f"-h '{PG_HOST}' -p {PG_PORT} -k /tmp -c fsync=off "
+                f"-c synchronous_commit=off -c full_page_writes=off")
+        r = self._sh(f"{PG_BIN}/pg_ctl -D '{self.pgdata}' -l '{log}' -o \"{opts}\" -w start",
+                     timeout=60)
+        # -w waits for ready; if it returns nonzero, poll pg_isready as a fallback
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if _run([f"{PG_BIN}/pg_isready", "-h", PG_HOST, "-p", str(PG_PORT),
+                     "-U", "postgres"]).returncode == 0:
+                return
+            time.sleep(0.2)
+        raise RuntimeError(f"postgres did not become ready: {r.stderr[-300:]}")
+
+    def stop(self) -> None:
+        self._sh(f"{PG_BIN}/pg_ctl -D '{self.pgdata}' -m immediate stop", timeout=20)
+        # wait until it is actually down
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if _run([f"{PG_BIN}/pg_isready", "-h", PG_HOST, "-p", str(PG_PORT),
+                     "-U", "postgres"]).returncode != 0:
+                return
+            time.sleep(0.05)
 
     def is_up(self) -> bool:
-        try:
-            info = self._pgserver.utils.PostmasterInfo.read_from_pgdata(self.pgdata)
-            return info is not None and info.is_running()
-        except Exception:
-            return False
+        return _run([f"{PG_BIN}/pg_isready", "-h", PG_HOST, "-p", str(PG_PORT),
+                     "-U", "postgres"]).returncode == 0
 
     def cleanup(self) -> None:
         try:
-            self.server.cleanup()
+            self.stop()
         except Exception:
             pass
 
@@ -223,13 +273,13 @@ def main():
     down_s = pt_down["T_ms"] / 1000.0
     cc.clock_armed(CASE, {**pt_when, "phase": phase, "down_ms": pt_down["T_ms"]})
 
-    # --- Boot embedded Postgres --------------------------------------------------------
+    # --- Boot the guest's system Postgres ----------------------------------------------
     try:
-        pg = PgserverHandle(pgdata)
+        pg = SystemPgHandle(pgdata)
     except Exception as exc:
-        cc.void(f"embedded postgres failed to boot: {type(exc).__name__}: {exc}")
+        cc.void(f"system postgres failed to boot: {type(exc).__name__}: {exc}")
     db_url = pg.uri()
-    cc.log(f"embedded pg up: {db_url}")
+    cc.log(f"system pg up: {db_url}")
 
     # --- App module used for both the seed run and the recovery run -------------------
     app_path = WORK_DIR / f"app-{seed}.py"
